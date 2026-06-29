@@ -50,7 +50,7 @@ const (
 )
 
 type Client struct {
-	conn *dtls.DTLSConn
+	conn transport
 
 	host  string
 	uid   string
@@ -60,6 +60,7 @@ type Client struct {
 
 	authKey string
 	verbose bool
+	useDTLS bool
 
 	closed  bool
 	closeMu sync.Mutex
@@ -85,10 +86,6 @@ func Dial(rawURL string) (*Client, error) {
 
 	query := u.Query()
 
-	if query.Get("dtls") != "true" {
-		return nil, fmt.Errorf("wyze: only DTLS cameras are supported")
-	}
-
 	c := &Client{
 		host:    u.Host,
 		uid:     query.Get("uid"),
@@ -96,6 +93,7 @@ func Dial(rawURL string) (*Client, error) {
 		mac:     query.Get("mac"),
 		model:   query.Get("model"),
 		verbose: query.Get("verbose") == "true",
+		useDTLS: query.Get("dtls") == "true",
 	}
 
 	c.authKey = string(dtls.CalculateAuthKey(c.enr, c.mac))
@@ -302,6 +300,19 @@ func (c *Client) connect() error {
 			port = p
 		}
 		host = host[:idx]
+	}
+
+	if !c.useDTLS {
+		// Non-DTLS (TransCode firmware) cameras: plain TUTK P2P link.
+		conn, err := dialTUTK(host, c.uid, c.enr)
+		if err != nil {
+			return err
+		}
+		c.conn = conn
+		if c.verbose {
+			fmt.Printf("[Wyze] Connected to %s (IOTC, non-DTLS)\n", conn.RemoteAddr())
+		}
+		return nil
 	}
 
 	conn, err := dtls.DialDTLS(host, port, c.uid, c.authKey, c.enr, c.verbose)
@@ -567,6 +578,11 @@ func (c *Client) matchHL(expectCmd uint16) func([]byte) bool {
 }
 
 func (c *Client) extractHL(data []byte) []byte {
+	// Non-DTLS responses arrive as the bare HL command (ctrl_type already
+	// stripped), so 'HL' is at offset 0.
+	if len(data) >= 2 && data[0] == 'H' && data[1] == 'L' {
+		return data
+	}
 	// Try offset 32 (magicIOCtrl, protoVersion)
 	if hlData := tutk.FindHL(data, 32); hlData != nil {
 		return hlData

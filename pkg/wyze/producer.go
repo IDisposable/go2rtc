@@ -176,6 +176,14 @@ func probe(client *Client, quality byte) ([]*core.Media, error) {
 
 		pkt, err := client.ReadPacket()
 		if err != nil {
+			// Audio was advertised but none arrived before the deadline: don't
+			// sink the whole stream, fall back to video-only.
+			if vcodec != nil {
+				if client.verbose {
+					fmt.Println("[Wyze] probe: no audio before deadline, continuing video-only")
+				}
+				break
+			}
 			return nil, fmt.Errorf("wyze: probe: %w", err)
 		}
 		if pkt == nil || len(pkt.Payload) < 5 {
