@@ -3,6 +3,7 @@ package wyze
 import (
 	"fmt"
 	"net"
+	"strconv"
 	"sync"
 	"time"
 
@@ -14,20 +15,17 @@ import (
 // DTLS path, but the AV login is handled by tutk.Dial and HL commands ride
 // inside TUTK IOCtrl messages instead of DTLS records.
 //
-// RECONSTRUCTED FROM PUBLIC SOURCES — three things must be confirmed against a
-// real non-DTLS camera (and docker-wyze-bridge's tutk_protocol.py):
+// Unverified, confirm against a non-DTLS camera + tutk_protocol.py:
+//   - tutkCredUser / password for tutk.Dial (AV login).
+//   - HL ctrl_type (defaultHLType, override via URL hltype). Verbose mode logs
+//     every incoming ctrl_type to reveal the right value.
+//   - whether older firmware speaks HL at all vs legacy avSendIOCtrl JSON.
 //
-//  1. tutkCredUser / the password used for tutk.Dial (AV login).
-//  2. ioctrlTypeHL: the IOCtrl ctrl_type that wraps an HL K-command. The HL
-//     header already carries the K-number in its cmdID field, so this is most
-//     likely a single fixed transport type rather than per-command.
-//  3. Whether older firmware speaks HL K-commands at all (some may use the
-//     legacy avSendIOCtrl JSON command set, like the Xiaomi path).
-//
-// Two-way audio (intercom) over non-DTLS is intentionally disabled until the
-// backchannel framing is confirmed; video + listen-only audio are the goal.
+// Intercom is disabled here; video + listen-only audio only.
 type tutkTransport struct {
-	conn *tutk.Conn
+	conn    *tutk.Conn
+	hlType  uint32
+	verbose bool
 
 	videoTS tsAccum
 	audioTS tsAccum
@@ -36,42 +34,64 @@ type tutkTransport struct {
 	closed  bool
 }
 
-const (
-	// tutkCredUser is the AV-login username. The DTLS path uses "admin" with
-	// the ENR as the password; the non-DTLS path is assumed to match.
-	tutkCredUser = "admin"
+// tutkCredUser is the AV-login username. The DTLS path uses "admin" with the
+// ENR as the password; the non-DTLS path is assumed to match.
+// TODO(verify) against tutk_protocol.py / a V3 capture.
+const tutkCredUser = "admin"
 
-	// ioctrlTypeHL is the TUTK IOCtrl ctrl_type that carries an HL K-command.
-	// TODO(verify): confirm against tutk_protocol.py / a capture. This value is
-	// a placeholder — non-DTLS auth will not succeed until it is correct.
-	ioctrlTypeHL uint32 = 0x06
-)
+// defaultHLType is the placeholder IOCtrl ctrl_type wrapping an HL K-command.
+// Override per-camera with the URL hltype param. TODO(verify).
+const defaultHLType uint32 = 0x06
 
-func dialTUTK(host, uid, enr string) (*tutkTransport, error) {
+func parseHLType(s string) uint32 {
+	if s == "" {
+		return defaultHLType
+	}
+	if v, err := strconv.ParseUint(s, 0, 32); err == nil {
+		return uint32(v)
+	}
+	return defaultHLType
+}
+
+func dialTUTK(host, uid, enr string, hlType uint32, verbose bool) (*tutkTransport, error) {
+	if verbose {
+		fmt.Printf("[Wyze/tutk] dial %s uid=%s user=%s hltype=0x%x\n", host, uid, tutkCredUser, hlType)
+	}
 	conn, err := tutk.Dial(host, uid, tutkCredUser, enr)
 	if err != nil {
 		return nil, fmt.Errorf("wyze: tutk dial failed: %w", err)
 	}
-	return &tutkTransport{conn: conn}, nil
+	if verbose {
+		fmt.Printf("[Wyze/tutk] connected %s\n", conn.Version())
+	}
+	return &tutkTransport{conn: conn, hlType: hlType, verbose: verbose}, nil
 }
 
 // AVClientStart is a no-op: tutk.Dial already performed the AV-login handshake.
 func (t *tutkTransport) AVClientStart(time.Duration) error { return nil }
 
 func (t *tutkTransport) WriteIOCtrl(payload []byte) error {
-	return t.conn.WriteCommand(ioctrlTypeHL, payload)
+	return t.conn.WriteCommand(t.hlType, payload)
 }
 
 func (t *tutkTransport) WriteAndWaitIOCtrl(payload []byte, match func([]byte) bool, timeout time.Duration) ([]byte, error) {
-	if err := t.conn.WriteCommand(ioctrlTypeHL, payload); err != nil {
+	if cmdID, _, ok := tutk.ParseHL(payload); ok && t.verbose {
+		fmt.Printf("[Wyze/tutk] -> ctrl_type=0x%x HL cmd=%d\n", t.hlType, cmdID)
+	}
+	if err := t.conn.WriteCommand(t.hlType, payload); err != nil {
 		return nil, err
 	}
 
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		_, data, err := t.conn.ReadCommand()
+		ctrlType, data, err := t.conn.ReadCommand()
 		if err != nil {
 			return nil, err
+		}
+		// Log every incoming ctrl_type to reveal what the camera uses for HL.
+		if t.verbose {
+			cmdID, _, _ := tutk.ParseHL(data)
+			fmt.Printf("[Wyze/tutk] <- ctrl_type=0x%x len=%d HL cmd=%d\n", ctrlType, len(data), cmdID)
 		}
 		// ReadCommand strips the 4-byte ctrl_type, so data starts at the HL
 		// header. match (Client.matchHL) finds 'HL' from offset 0.

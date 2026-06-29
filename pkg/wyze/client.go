@@ -61,6 +61,7 @@ type Client struct {
 	authKey string
 	verbose bool
 	useDTLS bool
+	hlType  uint32 // non-DTLS IOCtrl ctrl_type wrapping HL (URL: hltype)
 
 	closed  bool
 	closeMu sync.Mutex
@@ -94,6 +95,7 @@ func Dial(rawURL string) (*Client, error) {
 		model:   query.Get("model"),
 		verbose: query.Get("verbose") == "true",
 		useDTLS: query.Get("dtls") == "true",
+		hlType:  parseHLType(query.Get("hltype")),
 	}
 
 	c.authKey = string(dtls.CalculateAuthKey(c.enr, c.mac))
@@ -304,7 +306,7 @@ func (c *Client) connect() error {
 
 	if !c.useDTLS {
 		// Non-DTLS (TransCode firmware) cameras: plain TUTK P2P link.
-		conn, err := dialTUTK(host, c.uid, c.enr)
+		conn, err := dialTUTK(host, c.uid, c.enr, c.hlType, c.verbose)
 		if err != nil {
 			return err
 		}

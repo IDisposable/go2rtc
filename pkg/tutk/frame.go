@@ -498,8 +498,14 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 		return
 	}
 
+	prevRaw := h.videoTS.lastRawTS
 	accumUS := h.videoTS.update(fi.Timestamp)
 	rtpTS := uint32(accumUS * 90000 / 1000000)
+
+	if h.verbose {
+		fmt.Printf("[TS] ch=0x%02x raw=%d delta=%d accum_us=%d\n",
+			channel, fi.Timestamp, fi.Timestamp-prevRaw, accumUS)
+	}
 
 	pkt := &Packet{
 		Channel:    channel,
