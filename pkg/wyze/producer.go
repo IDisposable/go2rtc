@@ -63,16 +63,23 @@ func NewProducer(rawURL string) (*Producer, error) {
 	return prod, nil
 }
 
-func (p *Producer) Start() error {
-	for {
-		if p.client.verbose {
-			fmt.Println("[Wyze] Reading packet...")
-		}
+type frameDropser interface{ FrameDrops() uint64 }
 
+func (p *Producer) Start() error {
+	ds, _ := p.client.conn.(frameDropser)
+	var frames uint64
+
+	for {
 		_ = p.client.SetDeadline(time.Now().Add(core.ConnDeadline))
 		pkt, err := p.client.ReadPacket()
 		if err != nil {
 			return err
+		}
+
+		if p.client.verbose && ds != nil {
+			if frames++; frames%300 == 0 {
+				fmt.Printf("[Wyze] frames=%d drops=%d\n", frames, ds.FrameDrops())
+			}
 		}
 		if pkt == nil {
 			continue

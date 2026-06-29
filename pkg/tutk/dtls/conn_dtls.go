@@ -456,6 +456,14 @@ func (c *DTLSConn) HasTwoWayStreaming() bool {
 	return c.hasTwoWayStreaming
 }
 
+// FrameDrops returns video frames dropped due to lost packets.
+func (c *DTLSConn) FrameDrops() uint64 {
+	if c.frames != nil {
+		return c.frames.OOODrops()
+	}
+	return 0
+}
+
 func (c *DTLSConn) IsBackchannelReady() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
