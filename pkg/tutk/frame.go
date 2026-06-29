@@ -78,11 +78,21 @@ func (fi *FrameInfo) Channels() uint8 {
 }
 
 func ParseFrameInfo(data []byte) *FrameInfo {
-	if len(data) < frameInfoSize {
+	return ParseFrameInfoSize(data, frameInfoSize)
+}
+
+// ParseFrameInfoSize parses the FrameInfo from the last fiSize bytes of data.
+// The struct fields live at the start of that trailer, so a larger doorbell
+// trailer (48 bytes) is read from a deeper offset but the same field layout.
+func ParseFrameInfoSize(data []byte, fiSize int) *FrameInfo {
+	if fiSize < frameInfoSize {
+		fiSize = frameInfoSize
+	}
+	if len(data) < fiSize {
 		return nil
 	}
 
-	offset := len(data) - frameInfoSize
+	offset := len(data) - fiSize
 	fi := data[offset:]
 
 	return &FrameInfo{
@@ -112,14 +122,26 @@ type Packet struct {
 }
 
 type PacketHeader struct {
-	Channel      byte
-	FrameType    byte
-	HeaderSize   int
-	FrameNo      uint32
-	PktIdx       uint16
-	PktTotal     uint16
-	PayloadSize  uint16
-	HasFrameInfo bool
+	Channel       byte
+	FrameType     byte
+	HeaderSize    int
+	FrameNo       uint32
+	PktIdx        uint16
+	PktTotal      uint16
+	PayloadSize   uint16
+	HasFrameInfo  bool
+	FrameInfoSize int // trailer size from the marker (40=0x28 standard, 48=0x30 doorbell)
+}
+
+// isFrameInfoMarker reports whether the field that normally holds the packet
+// index is instead a FrameInfo size marker. Standard devices use 0x0028 (40
+// bytes); some doorbells use 0x0030 (48 bytes). A value >= PktTotal can't be a
+// real packet index either, so it is treated as a marker too.
+func isFrameInfoMarker(val, pktTotal uint16, frameType uint8) bool {
+	if !IsEndFrame(frameType) && pktTotal != 1 {
+		return false
+	}
+	return val == 0x0028 || (pktTotal > 0 && val >= pktTotal)
 }
 
 func ParsePacketHeader(data []byte) *PacketHeader {
@@ -144,34 +166,25 @@ func ParsePacketHeader(data []byte) *PacketHeader {
 		return nil
 	}
 
-	if hdr.HeaderSize == 28 {
-		hdr.PktTotal = binary.LittleEndian.Uint16(data[12:])
-		pktIdxOrMarker := binary.LittleEndian.Uint16(data[14:])
-		hdr.PayloadSize = binary.LittleEndian.Uint16(data[16:])
-		hdr.FrameNo = binary.LittleEndian.Uint32(data[24:])
+	// 28-byte and 36-byte headers carry the same fields at different offsets.
+	totalOff, idxOff, sizeOff, frameOff := 12, 14, 16, 24
+	if hdr.HeaderSize == 36 {
+		totalOff, idxOff, sizeOff, frameOff = 20, 22, 24, 32
+	}
 
-		if pktIdxOrMarker == 0x0028 && (IsEndFrame(frameType) || hdr.PktTotal == 1) {
-			hdr.HasFrameInfo = true
-			if hdr.PktTotal > 0 {
-				hdr.PktIdx = hdr.PktTotal - 1
-			}
-		} else {
-			hdr.PktIdx = pktIdxOrMarker
+	hdr.PktTotal = binary.LittleEndian.Uint16(data[totalOff:])
+	pktIdxOrMarker := binary.LittleEndian.Uint16(data[idxOff:])
+	hdr.PayloadSize = binary.LittleEndian.Uint16(data[sizeOff:])
+	hdr.FrameNo = binary.LittleEndian.Uint32(data[frameOff:])
+
+	if isFrameInfoMarker(pktIdxOrMarker, hdr.PktTotal, frameType) {
+		hdr.HasFrameInfo = true
+		hdr.FrameInfoSize = int(pktIdxOrMarker) // marker value == trailer byte count
+		if hdr.PktTotal > 0 {
+			hdr.PktIdx = hdr.PktTotal - 1
 		}
 	} else {
-		hdr.PktTotal = binary.LittleEndian.Uint16(data[20:])
-		pktIdxOrMarker := binary.LittleEndian.Uint16(data[22:])
-		hdr.PayloadSize = binary.LittleEndian.Uint16(data[24:])
-		hdr.FrameNo = binary.LittleEndian.Uint32(data[32:])
-
-		if pktIdxOrMarker == 0x0028 && (IsEndFrame(frameType) || hdr.PktTotal == 1) {
-			hdr.HasFrameInfo = true
-			if hdr.PktTotal > 0 {
-				hdr.PktIdx = hdr.PktTotal - 1
-			}
-		} else {
-			hdr.PktIdx = pktIdxOrMarker
-		}
+		hdr.PktIdx = pktIdxOrMarker
 	}
 
 	return hdr
@@ -191,27 +204,70 @@ func IsContinuationFrame(frameType uint8) bool {
 	return frameType == FrameTypeCont || frameType == FrameTypeContAlt
 }
 
+// maxFramePackets bounds the per-frame packet table so a corrupt header
+// claiming a huge pktTotal can't trigger a giant allocation.
+const maxFramePackets = 1024
+
+// channelState reassembles one video frame at a time. Packets can arrive out
+// of order over UDP, so each is placed into pkts by its index and the frame is
+// emitted once every slot is filled and the FrameInfo (carried by the end
+// packet) has been seen. This tolerates intra-frame reordering instead of
+// dropping the whole frame on the first out-of-order packet.
 type channelState struct {
-	frameNo    uint32     // current frame being assembled
-	pktTotal   uint16     // expected total packets
-	waitSeq    uint16     // next expected packet index (0, 1, 2, ...)
-	waitData   []byte     // accumulated payload data
-	frameInfo  *FrameInfo // frame info (from end packet)
-	hasStarted bool       // received first packet of frame
-	lastPktIdx uint16     // last received packet index (for OOO detection)
+	frameNo   uint32     // frame currently being assembled (0 = none active)
+	pktTotal  uint16     // expected packet count for the current frame
+	pkts      [][]byte   // payloads indexed by PktIdx; nil = not yet received
+	received  uint16     // number of filled slots in pkts
+	frameInfo *FrameInfo // metadata from the packet that carries it
+	lastDone  uint32     // last frameNo emitted or dropped (straggler guard)
+	hasDone   bool       // lastDone has been set
 }
 
-func (cs *channelState) reset() {
-	cs.frameNo = 0
-	cs.pktTotal = 0
-	cs.waitSeq = 0
-	cs.waitData = cs.waitData[:0]
+// startFrame begins assembling frameNo, sizing the packet table to pktTotal.
+// Returns false if pktTotal is implausible (corrupt header).
+func (cs *channelState) startFrame(frameNo uint32, pktTotal uint16) bool {
+	if pktTotal == 0 || pktTotal > maxFramePackets {
+		return false
+	}
+	cs.frameNo = frameNo
+	cs.pktTotal = pktTotal
+	if cap(cs.pkts) >= int(pktTotal) {
+		cs.pkts = cs.pkts[:pktTotal]
+		for i := range cs.pkts {
+			cs.pkts[i] = nil
+		}
+	} else {
+		cs.pkts = make([][]byte, pktTotal)
+	}
+	cs.received = 0
 	cs.frameInfo = nil
-	cs.hasStarted = false
-	cs.lastPktIdx = 0
+	return true
 }
+
+// done marks the current frame finished (emitted or dropped) so later
+// stragglers for it are ignored, and clears the in-progress state.
+func (cs *channelState) done() {
+	cs.lastDone = cs.frameNo
+	cs.hasDone = true
+	cs.frameNo = 0
+}
+
+// frameNewer reports whether frame a is later than frame b, wrap-safe.
+func frameNewer(a, b uint32) bool { return int32(a-b) > 0 }
 
 const tsWrapPeriod uint32 = 1000000
+
+// tsMaxPlausibleDeltaUS bounds a single inter-frame timestamp delta. Anything
+// larger is treated as a glitch/stall and contributes no time, so a corrupt or
+// mis-modelled timestamp can't make accumUS jump by minutes and shatter A/V
+// sync.
+//
+// NOTE: the wrap model below assumes the camera timestamp is microseconds that
+// wrap at tsWrapPeriod (every second). Real captures suggest it may instead be
+// a free-running uint32 microsecond counter (wrapping at 2^32); if so this
+// branch is wrong and should switch to plain uint32 wraparound subtraction.
+// Pending confirmation against hardware, the clamp keeps either model safe.
+const tsMaxPlausibleDeltaUS = 5 * tsWrapPeriod
 
 type tsTracker struct {
 	lastRawTS uint32
@@ -234,6 +290,10 @@ func (t *tsTracker) update(rawTS uint32) uint64 {
 		delta = (tsWrapPeriod - t.lastRawTS) + rawTS
 	}
 
+	if delta > tsMaxPlausibleDeltaUS {
+		delta = 0 // implausible jump (glitch, reorder, or wrong wrap model)
+	}
+
 	t.accumUS += uint64(delta)
 	t.lastRawTS = rawTS
 
@@ -248,7 +308,7 @@ type FrameHandler struct {
 	verbose  bool
 	closed   bool
 	closeMu  sync.Mutex
-	oooDrops uint64 // frames dropped due to out-of-order packets
+	oooDrops uint64 // video frames dropped because a packet was lost (never arrived)
 }
 
 func (h *FrameHandler) OOODrops() uint64 {
@@ -284,7 +344,7 @@ func (h *FrameHandler) Handle(data []byte) {
 		return
 	}
 
-	payload, fi := h.extractPayload(data, hdr.Channel)
+	payload, fi := h.extractPayload(data, hdr.Channel, hdr.FrameInfoSize)
 	if payload == nil {
 		return
 	}
@@ -307,7 +367,7 @@ func (h *FrameHandler) Handle(data []byte) {
 	}
 }
 
-func (h *FrameHandler) extractPayload(data []byte, channel byte) ([]byte, *FrameInfo) {
+func (h *FrameHandler) extractPayload(data []byte, channel byte, fiSizeHint int) ([]byte, *FrameInfo) {
 	if len(data) < 2 {
 		return nil, nil
 	}
@@ -334,6 +394,11 @@ func (h *FrameHandler) extractPayload(data []byte, channel byte) ([]byte, *Frame
 		fiSize = frameInfoSize
 	}
 
+	// Honor the marker-derived trailer size (doorbells use 48 instead of 40).
+	if fiSize > 0 && fiSizeHint > fiSize {
+		fiSize = fiSizeHint
+	}
+
 	if len(data) < headerSize {
 		return nil, nil
 	}
@@ -346,7 +411,7 @@ func (h *FrameHandler) extractPayload(data []byte, channel byte) ([]byte, *Frame
 		return data[headerSize:], nil
 	}
 
-	fi := ParseFrameInfo(data)
+	fi := ParseFrameInfoSize(data, fiSize)
 
 	validCodec := false
 	switch channel {
@@ -371,61 +436,65 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 		h.channels[channel] = cs
 	}
 
-	// New frame number - reset and start fresh
-	if hdr.FrameNo != cs.frameNo {
-		if hdr.PktIdx != 0 {
-			return // stray continuation for a frame we never started / gave up on
-		}
-		// Check if previous frame was incomplete
-		if cs.hasStarted && cs.waitSeq < cs.pktTotal {
-			fmt.Printf("[DROP] ch=0x%02x #%d INCOMPLETE: got %d/%d pkts\n",
-				channel, cs.frameNo, cs.waitSeq, cs.pktTotal)
-		}
-		cs.reset()
-		cs.frameNo = hdr.FrameNo
-		cs.pktTotal = hdr.PktTotal
-	}
-
-	// If packet index doesn't match expected, drop entire frame (data loss)
-	if hdr.PktIdx != cs.waitSeq {
-		fmt.Printf("[OOO] ch=0x%02x #%d frameType=0x%02x pktTotal=%d expected pkt %d, got %d - drop frame\n",
-			channel, hdr.FrameNo, hdr.FrameType, hdr.PktTotal, cs.waitSeq, hdr.PktIdx)
-		h.oooDrops++
-		// reset() clears frameNo, so the remaining packets of this dropped
-		// frame fall into the new-frame guard above (FrameNo != cs.frameNo,
-		// PktIdx != 0) and are silently absorbed without re-logging [OOO].
-		cs.reset()
+	// Straggler from a frame we already emitted or dropped.
+	if cs.hasDone && !frameNewer(hdr.FrameNo, cs.lastDone) {
 		return
 	}
 
-	// First packet - mark as started
-	if cs.waitSeq == 0 {
-		cs.hasStarted = true
+	if cs.frameNo == 0 || hdr.FrameNo != cs.frameNo {
+		if cs.frameNo != 0 {
+			if !frameNewer(hdr.FrameNo, cs.frameNo) {
+				return // packet for an older frame we already moved past
+			}
+			// A newer frame began before the current one finished: the current
+			// frame is missing packets that will never arrive. Drop it once.
+			h.dropIncomplete(channel, cs)
+		}
+		if !cs.startFrame(hdr.FrameNo, hdr.PktTotal) {
+			return
+		}
 	}
 
-	cs.waitData = append(cs.waitData, payload...)
-	cs.waitSeq++
-
-	// Store frame info if present
+	if int(hdr.PktIdx) >= len(cs.pkts) {
+		return // index past declared total - corrupt header
+	}
+	if cs.pkts[hdr.PktIdx] == nil {
+		// payload aliases the shared read buffer, so copy it.
+		cs.pkts[hdr.PktIdx] = append([]byte(nil), payload...)
+		cs.received++
+	}
 	if fi != nil {
 		cs.frameInfo = fi
 	}
 
-	// Check if frame is complete
-	if cs.waitSeq != cs.pktTotal || cs.frameInfo == nil {
+	// Need every packet plus the FrameInfo before we can emit.
+	if cs.received != cs.pktTotal || cs.frameInfo == nil {
 		return
 	}
 
 	fi = cs.frameInfo
-	defer cs.reset()
+	frameNo := cs.frameNo
 
-	if fi.PayloadSize > 0 && uint32(len(cs.waitData)) != fi.PayloadSize {
-		fmt.Printf("[SIZE] ch=0x%02x #%d mismatch: expected %d, got %d\n",
-			channel, cs.frameNo, fi.PayloadSize, len(cs.waitData))
+	var size int
+	for _, p := range cs.pkts {
+		size += len(p)
+	}
+	data := make([]byte, 0, size)
+	for _, p := range cs.pkts {
+		data = append(data, p...)
+	}
+
+	cs.done()
+
+	if fi.PayloadSize > 0 && uint32(len(data)) != fi.PayloadSize {
+		if h.verbose {
+			fmt.Printf("[SIZE] ch=0x%02x #%d mismatch: expected %d, got %d\n",
+				channel, frameNo, fi.PayloadSize, len(data))
+		}
 		return
 	}
 
-	if len(cs.waitData) == 0 {
+	if len(data) == 0 {
 		return
 	}
 
@@ -434,7 +503,7 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 
 	pkt := &Packet{
 		Channel:    channel,
-		Payload:    append([]byte{}, cs.waitData...),
+		Payload:    data,
 		Codec:      fi.CodecID,
 		Timestamp:  rtpTS,
 		IsKeyframe: fi.IsKeyframe(),
@@ -459,6 +528,17 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 	}
 
 	h.queue(pkt)
+}
+
+// dropIncomplete records that the in-progress frame was abandoned because a
+// later frame began before it finished (a packet was lost for good).
+func (h *FrameHandler) dropIncomplete(channel byte, cs *channelState) {
+	if h.verbose {
+		fmt.Printf("[DROP] ch=0x%02x #%d incomplete: got %d/%d pkts\n",
+			channel, cs.frameNo, cs.received, cs.pktTotal)
+	}
+	h.oooDrops++
+	cs.done()
 }
 
 func (h *FrameHandler) handleAudio(payload []byte, fi *FrameInfo) {
