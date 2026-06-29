@@ -72,6 +72,9 @@ type Client struct {
 	audioCodecID    byte
 	audioSampleRate uint32
 	audioChannels   uint8
+
+	ctrlMu    sync.Mutex
+	ctrlWaits map[uint16]struct{} // opcodes with an outstanding SendControlWait
 }
 
 type AuthResponse struct {

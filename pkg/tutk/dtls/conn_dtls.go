@@ -920,13 +920,13 @@ func (c *DTLSConn) msgTxData(payload []byte, channel byte) []byte {
 	copy(b, "\x04\x02\x1a\x0b")                            // marker + mode=data
 	binary.LittleEndian.PutUint16(b[4:], uint16(bodySize)) // body size
 	binary.LittleEndian.PutUint16(b[6:], seq)              // sequence
-	binary.LittleEndian.PutUint16(b[8:], cmdDataTX)   // 0x0407
-	binary.LittleEndian.PutUint16(b[10:], 0x0021)     // flags
-	copy(b[12:], c.sid[:2])                           // rid[0:2]
-	b[14] = channel                                   // channel
-	b[15] = 0x01                                      // marker
-	binary.LittleEndian.PutUint32(b[16:], 0x0000000c) // const
-	copy(b[20:], c.sid[:8])                           // rid
+	binary.LittleEndian.PutUint16(b[8:], cmdDataTX)        // 0x0407
+	binary.LittleEndian.PutUint16(b[10:], 0x0021)          // flags
+	copy(b[12:], c.sid[:2])                                // rid[0:2]
+	b[14] = channel                                        // channel
+	b[15] = 0x01                                           // marker
+	binary.LittleEndian.PutUint32(b[16:], 0x0000000c)      // const
+	copy(b[20:], c.sid[:8])                                // rid
 	copy(b[28:], payload)
 	return b
 }

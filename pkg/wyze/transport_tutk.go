@@ -112,7 +112,7 @@ func (t *tutkTransport) AVRecvFrameData() (*tutk.Packet, error) {
 	// 40-byte Wyze FrameInfo trailer.
 	fi := tutk.ParseFrameInfo(hdr)
 	if fi == nil || len(payload) == 0 {
-		return nil, nil // skip frames we can't interpret
+		return nil, nil // skip uninterpretable frames
 	}
 
 	pkt := &tutk.Packet{

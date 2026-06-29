@@ -156,8 +156,8 @@ func TestParsePacketHeader(t *testing.T) {
 			wantNil: true,
 		},
 		{
-			// Doorbells (WYZEDB3) flag FrameInfo with a 0x0030 (48-byte) marker
-			// instead of 0x0028 (40-byte). Regression guard for PR #2249.
+			// Doorbells (WYZEDB3) flag FrameInfo with a 0x0030 (48-byte) marker;
+			// standard devices use 0x0028 (40-byte).
 			name:       "doorbell 48-byte FrameInfo marker",
 			data:       videoEndMarker(9, 2, 0x0030, []byte("DDDD"), CodecH264, 48),
 			headerSize: 28, frameNo: 9, pktIdx: 1, pktTotal: 2, hasFrameInfo: true,
@@ -220,10 +220,9 @@ func TestHandleVideo_CleanFrame(t *testing.T) {
 	}
 }
 
-// TestHandleVideo_Reordered verifies that a frame whose packets arrive out of
-// order (including the FrameInfo-carrying end packet first) is still assembled
-// correctly with no drops. This is the reorder-tolerance behavior that replaces
-// the old drop-on-OOO logic and fixes the HLS breakage from #2215.
+// TestHandleVideo_Reordered verifies a frame whose packets arrive out of order
+// (including the FrameInfo-carrying end packet first) still assembles correctly
+// with no drops.
 func TestHandleVideo_Reordered(t *testing.T) {
 	h := NewFrameHandler(false)
 
@@ -245,10 +244,9 @@ func TestHandleVideo_Reordered(t *testing.T) {
 	}
 }
 
-// TestHandleVideo_LostPacketDropAndRecover is the regression guard for #2215: a
-// genuinely lost packet must drop the frame exactly once (not once per
-// remaining packet), stragglers of that frame must be ignored, and the next
-// frame must still assemble cleanly.
+// TestHandleVideo_LostPacketDropAndRecover verifies a genuinely lost packet
+// drops the frame exactly once (not once per remaining packet), stragglers of
+// that frame are ignored, and the next frame still assembles cleanly.
 func TestHandleVideo_LostPacketDropAndRecover(t *testing.T) {
 	h := NewFrameHandler(false)
 

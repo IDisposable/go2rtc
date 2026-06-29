@@ -58,6 +58,20 @@ func (s *Stream) Sources() []string {
 	return sources
 }
 
+// Producers returns the underlying core.Producer of each attached producer,
+// letting callers reach a concrete producer (e.g. for runtime control).
+func (s *Stream) Producers() []core.Producer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := make([]core.Producer, 0, len(s.producers))
+	for _, p := range s.producers {
+		if p.conn != nil {
+			out = append(out, p.conn)
+		}
+	}
+	return out
+}
+
 func (s *Stream) SetSource(source string) {
 	for _, prod := range s.producers {
 		prod.SetSource(source)

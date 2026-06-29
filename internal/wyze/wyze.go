@@ -37,6 +37,8 @@ func Init() {
 	})
 
 	api.HandleFunc("api/wyze", apiWyze)
+
+	registerControlEndpoints()
 }
 
 func getCloud(email string) (*wyze.Cloud, error) {

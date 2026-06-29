@@ -9,9 +9,8 @@ import (
 )
 
 // TestMsgAudioFrame locks the on-wire layout of the two-way-audio (intercom)
-// frame the backchannel sends to the camera. The byte offsets here were
-// reverse-engineered from captures, so a golden test guards against accidental
-// drift when the surrounding code changes.
+// frame the backchannel sends to the camera. The byte offsets are magic
+// (capture-derived), so a golden test guards against drift.
 func TestMsgAudioFrame(t *testing.T) {
 	c := &DTLSConn{}
 	payload := []byte("\x01\x02\x03\x04")

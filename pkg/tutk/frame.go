@@ -211,8 +211,7 @@ const maxFramePackets = 1024
 // channelState reassembles one video frame at a time. Packets can arrive out
 // of order over UDP, so each is placed into pkts by its index and the frame is
 // emitted once every slot is filled and the FrameInfo (carried by the end
-// packet) has been seen. This tolerates intra-frame reordering instead of
-// dropping the whole frame on the first out-of-order packet.
+// packet) has been seen.
 type channelState struct {
 	frameNo   uint32     // frame currently being assembled (0 = none active)
 	pktTotal  uint16     // expected packet count for the current frame
@@ -257,16 +256,14 @@ func frameNewer(a, b uint32) bool { return int32(a-b) > 0 }
 
 const tsWrapPeriod uint32 = 1000000
 
-// tsMaxPlausibleDeltaUS bounds a single inter-frame timestamp delta. Anything
-// larger is treated as a glitch/stall and contributes no time, so a corrupt or
-// mis-modelled timestamp can't make accumUS jump by minutes and shatter A/V
-// sync.
+// tsMaxPlausibleDeltaUS bounds a single inter-frame timestamp delta; anything
+// larger contributes no time, so a corrupt or mis-modelled timestamp can't jump
+// accumUS by minutes and shatter A/V sync.
 //
-// NOTE: the wrap model below assumes the camera timestamp is microseconds that
-// wrap at tsWrapPeriod (every second). Real captures suggest it may instead be
-// a free-running uint32 microsecond counter (wrapping at 2^32); if so this
-// branch is wrong and should switch to plain uint32 wraparound subtraction.
-// Pending confirmation against hardware, the clamp keeps either model safe.
+// The update below assumes the camera timestamp is microseconds wrapping at
+// tsWrapPeriod (every second); it may instead be a free-running uint32 µs
+// counter wrapping at 2^32, unconfirmed against hardware. The clamp keeps both
+// models safe.
 const tsMaxPlausibleDeltaUS = 5 * tsWrapPeriod
 
 type tsTracker struct {
@@ -394,7 +391,7 @@ func (h *FrameHandler) extractPayload(data []byte, channel byte, fiSizeHint int)
 		fiSize = frameInfoSize
 	}
 
-	// Honor the marker-derived trailer size (doorbells use 48 instead of 40).
+	// Honor the marker-derived trailer size (standard 40, doorbells 48).
 	if fiSize > 0 && fiSizeHint > fiSize {
 		fiSize = fiSizeHint
 	}
@@ -436,7 +433,7 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 		h.channels[channel] = cs
 	}
 
-	// Straggler from a frame we already emitted or dropped.
+	// Straggler from an already-finished frame.
 	if cs.hasDone && !frameNewer(hdr.FrameNo, cs.lastDone) {
 		return
 	}
@@ -444,7 +441,7 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 	if cs.frameNo == 0 || hdr.FrameNo != cs.frameNo {
 		if cs.frameNo != 0 {
 			if !frameNewer(hdr.FrameNo, cs.frameNo) {
-				return // packet for an older frame we already moved past
+				return // packet for an older, already-abandoned frame
 			}
 			// A newer frame began before the current one finished: the current
 			// frame is missing packets that will never arrive. Drop it once.
@@ -467,7 +464,7 @@ func (h *FrameHandler) handleVideo(channel byte, hdr *PacketHeader, payload []by
 		cs.frameInfo = fi
 	}
 
-	// Need every packet plus the FrameInfo before we can emit.
+	// Need every packet plus the FrameInfo before emitting.
 	if cs.received != cs.pktTotal || cs.frameInfo == nil {
 		return
 	}
