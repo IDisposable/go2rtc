@@ -99,19 +99,22 @@ type DTLSConn struct {
 
 	// Protocol
 	isCC51       bool
-	seq          uint16
-	seqCmd       uint16
-	avSeq        uint32
-	kaSeq        uint32
-	audioSeq     uint32
+	kaSeq        uint32 // CC51 keepalive counter (reader goroutine only)
+	audioSeq     uint32 // backchannel TX (guarded by mu via AVSendAudioData)
 	audioFrameNo uint32
 
-	// Ack
+	// TX/ACK sequence counters shared by the worker, the periodic ACK
+	// goroutine and the control path; guarded by txMu.
+	txMu       sync.Mutex
+	seq        uint16
+	seqCmd     uint16
+	avSeq      uint32
 	ackFlags   uint16
 	rxSeqStart uint16
 	rxSeqEnd   uint16
 	rxSeqInit  bool
-	cmdAck     func()
+
+	cmdAck func() // guarded by mu
 }
 
 func DialDTLS(host string, port int, uid, authKey, enr string, verbose bool) (*DTLSConn, error) {
@@ -168,18 +171,23 @@ func DialDTLS(host string, port int, uid, authKey, enr string, verbose bool) (*D
 }
 
 func (c *DTLSConn) AVClientStart(timeout time.Duration) error {
+	conn := c.client()
+	if conn == nil {
+		return fmt.Errorf("av client not connected")
+	}
+
 	randomID := tutk.GenSessionID()
 	pkt1 := c.msgAVLogin(magicAVLogin1, 570, 0x0001, randomID)
 	pkt2 := c.msgAVLogin(magicAVLogin2, 572, 0x0000, randomID)
 	pkt2[20]++ // pkt2 has randomID incremented by 1
 
-	if _, err := c.clientConn.Write(pkt1); err != nil {
+	if _, err := conn.Write(pkt1); err != nil {
 		return fmt.Errorf("av login 1 failed: %w", err)
 	}
 
 	time.Sleep(10 * time.Millisecond)
 
-	if _, err := c.clientConn.Write(pkt2); err != nil {
+	if _, err := conn.Write(pkt2); err != nil {
 		return fmt.Errorf("av login 2 failed: %w", err)
 	}
 
@@ -195,8 +203,7 @@ func (c *DTLSConn) AVClientStart(timeout time.Duration) error {
 			if len(data) >= 32 && binary.LittleEndian.Uint16(data) == magicAVLoginResp {
 				c.hasTwoWayStreaming = data[31] == 1
 
-				ack := c.msgACK()
-				c.clientConn.Write(ack)
+				conn.Write(c.msgACK())
 
 				// Start ACK sender for continuous streaming
 				c.wg.Add(1)
@@ -210,9 +217,8 @@ func (c *DTLSConn) AVClientStart(timeout time.Duration) error {
 						case <-c.ctx.Done():
 							return
 						case <-ackTicker.C:
-							if c.clientConn != nil {
-								ack := c.msgACK()
-								c.clientConn.Write(ack)
+							if conn := c.client(); conn != nil {
+								conn.Write(c.msgACK())
 							}
 						}
 					}
@@ -433,8 +439,9 @@ func (c *DTLSConn) WriteAndWaitIOCtrl(payload []byte, match func([]byte) bool, t
 				return nil, io.EOF
 			}
 
-			ack := c.msgACK()
-			c.clientConn.Write(ack)
+			if conn := c.client(); conn != nil {
+				conn.Write(c.msgACK())
+			}
 
 			if match(data) {
 				return data, nil
@@ -455,7 +462,15 @@ func (c *DTLSConn) IsBackchannelReady() bool {
 	return c.serverConn != nil
 }
 
-func (c *DTLSConn) RemoteAddr() *net.UDPAddr {
+// client returns the main DTLS client connection under lock so callers don't
+// race with Close() clearing it.
+func (c *DTLSConn) client() *dtls.Conn {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.clientConn
+}
+
+func (c *DTLSConn) RemoteAddr() net.Addr {
 	return c.addr
 }
 
@@ -583,6 +598,11 @@ func (c *DTLSConn) connect() error {
 func (c *DTLSConn) worker() {
 	defer c.wg.Done()
 
+	conn := c.client()
+	if conn == nil {
+		return
+	}
+
 	buf := make([]byte, 2048)
 
 	for {
@@ -592,7 +612,7 @@ func (c *DTLSConn) worker() {
 		default:
 		}
 
-		n, err := c.clientConn.Read(buf)
+		n, err := conn.Read(buf)
 		if err != nil {
 			c.err = err
 			return
@@ -617,15 +637,17 @@ func (c *DTLSConn) worker() {
 			c.queue(c.rawCmd, data)
 
 		case protoVersion:
-			// Seq-Tracking
+			// Track the highest received command sequence, wrap-safe.
 			if len(data) >= 8 {
 				seq := binary.LittleEndian.Uint16(data[4:])
+				c.txMu.Lock()
 				if !c.rxSeqInit {
 					c.rxSeqInit = true
-				}
-				if seq > c.rxSeqEnd || c.rxSeqEnd == 0xffff {
+					c.rxSeqEnd = seq
+				} else if int16(seq-c.rxSeqEnd) > 0 {
 					c.rxSeqEnd = seq
 				}
+				c.txMu.Unlock()
 			}
 			c.queue(c.rawCmd, data)
 
@@ -880,12 +902,16 @@ func (c *DTLSConn) msgAudioFrame(payload []byte, timestampUS uint32, codec byte,
 }
 
 func (c *DTLSConn) msgTxData(payload []byte, channel byte) []byte {
+	c.txMu.Lock()
+	seq := c.seq
+	c.seq++
+	c.txMu.Unlock()
+
 	bodySize := 12 + len(payload)
 	b := make([]byte, 16+bodySize)
 	copy(b, "\x04\x02\x1a\x0b")                            // marker + mode=data
 	binary.LittleEndian.PutUint16(b[4:], uint16(bodySize)) // body size
-	binary.LittleEndian.PutUint16(b[6:], c.seq)            // sequence
-	c.seq++
+	binary.LittleEndian.PutUint16(b[6:], seq)              // sequence
 	binary.LittleEndian.PutUint16(b[8:], cmdDataTX)   // 0x0407
 	binary.LittleEndian.PutUint16(b[10:], 0x0021)     // flags
 	copy(b[12:], c.sid[:2])                           // rid[0:2]
@@ -915,6 +941,9 @@ func (c *DTLSConn) msgTxDataCC51(payload []byte, channel byte) []byte {
 }
 
 func (c *DTLSConn) msgACK() []byte {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
+
 	c.ackFlags++
 	b := make([]byte, 24)
 	binary.LittleEndian.PutUint16(b[0:], magicACK)     // 0x0009
@@ -946,6 +975,9 @@ func (c *DTLSConn) msgKeepalive(incoming []byte) []byte {
 }
 
 func (c *DTLSConn) msgIOCtrl(payload []byte) []byte {
+	c.txMu.Lock()
+	defer c.txMu.Unlock()
+
 	b := make([]byte, 40+len(payload))
 	binary.LittleEndian.PutUint16(b, protoVersion)     // magic
 	binary.LittleEndian.PutUint16(b[2:], protoVersion) // version
