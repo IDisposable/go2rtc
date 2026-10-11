@@ -73,7 +73,9 @@ type Client struct {
 	audioSampleRate uint32
 	audioChannels   uint8
 
-	ctrlMu    sync.Mutex
+	ctrlMu sync.Mutex
+
+	ptzReadMu sync.Mutex          // queues GetPTZPosition callers (one K11006 wait at a time)
 	ctrlWaits map[uint16]struct{} // opcodes with an outstanding SendControlWait
 }
 

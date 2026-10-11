@@ -61,7 +61,10 @@ func TestControlPayloads(t *testing.T) {
 		{"hflip", func(c *Client) error { return c.SetHorizontalFlip(true) }, KCmdSetHFlip, []byte{0, 0, 0, 0, 1, 0}},
 		{"vflip", func(c *Client) error { return c.SetVerticalFlip(true) }, KCmdSetVFlip, []byte{0, 0, 0, 0, 0, 1}},
 		{"take_photo", func(c *Client) error { return c.TakePhoto() }, KCmdTakePhoto, []byte{1}},
-		{"rotate_action", func(c *Client) error { return c.RotateByAction(2, 5) }, KCmdRotateByAction, []byte{2, 2, 5}},
+		{"rotate_action_left", func(c *Client) error { return c.RotateByAction(1, 5) }, KCmdRotateByAction, []byte{1, 0, 5}},
+		{"rotate_action_right", func(c *Client) error { return c.RotateByAction(2, 5) }, KCmdRotateByAction, []byte{2, 0, 5}},
+		{"rotate_action_up", func(c *Client) error { return c.RotateByAction(3, 5) }, KCmdRotateByAction, []byte{0, 1, 5}},
+		{"rotate_action_down", func(c *Client) error { return c.RotateByAction(4, 0) }, KCmdRotateByAction, []byte{0, 2, 5}},
 		{"rotate_degree", func(c *Client) error { return c.RotateByDegree(10, -5, 5) }, KCmdRotateByDegree, []byte{0x0a, 0x00, 0xfb, 0xff, 0x05}},
 		{"reset_rotation", func(c *Client) error { return c.ResetRotation() }, KCmdResetRotate, []byte{3}},
 	}
@@ -101,8 +104,8 @@ func TestControlValidation(t *testing.T) {
 	require.Error(t, c.SetIRLED(0))
 	require.Error(t, c.RotateByAction(9, 1))
 	require.Error(t, c.RotateByDegree(0, 200, 1)) // vDeg outside int8
-	require.Error(t, c.SetPTZPosition(99, 0))     // vertical > 40
-	require.Error(t, c.SetPTZPosition(0, 999))    // horizontal > 350
+	require.Error(t, c.SetPTZPosition(181, 0))    // vertical > 180
+	require.Error(t, c.SetPTZPosition(0, 360))    // horizontal > 359
 }
 
 func TestSendControlWaitSerialization(t *testing.T) {
@@ -123,4 +126,15 @@ func TestSendControl_HLBytes(t *testing.T) {
 	c := &Client{conn: rc}
 	require.NoError(t, c.SendControl(10042, []byte{3}))
 	require.True(t, bytes.Equal(rc.lastWrite, tutk.HL(10042, []byte{3})))
+}
+
+func TestParsePTZPosition(t *testing.T) {
+	hl := tutk.HL(KCmdGetCurCruise+1, []byte{0x01, 0x02, 0x03, 0x04, 20, 0x2c, 0x01}) // v=20 h=300
+	v, h, err := parsePTZPosition(hl)
+	require.NoError(t, err)
+	require.Equal(t, byte(20), v)
+	require.Equal(t, uint16(300), h)
+
+	_, _, err = parsePTZPosition(tutk.HL(KCmdGetCurCruise+1, []byte{1, 2}))
+	require.Error(t, err)
 }
