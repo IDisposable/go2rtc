@@ -272,11 +272,13 @@ func probe(client *Client, quality byte) ([]*core.Media, error) {
 		})
 
 		if client.SupportsIntercom() {
-			client.SetBackchannelCodec(tutkAudioCodec, acodec.ClockRate, uint8(acodec.Channels))
+			bc := acodec.Clone()
+			bc.ClockRate = backchannelRate(tutkAudioCodec, acodec.ClockRate)
+			client.SetBackchannelCodec(tutkAudioCodec, bc.ClockRate, uint8(bc.Channels))
 			medias = append(medias, &core.Media{
 				Kind:      core.KindAudio,
 				Direction: core.DirectionSendonly,
-				Codecs:    []*core.Codec{acodec.Clone()},
+				Codecs:    []*core.Codec{bc},
 			})
 		}
 	}
@@ -289,4 +291,16 @@ func probe(client *Client, quality byte) ([]*core.Media, error) {
 	}
 
 	return medias, nil
+}
+
+// backchannelRate is the sample rate the camera's speaker actually plays.
+// Wyze cameras that capture 8 kHz PCM play the speaker channel at 16 kHz
+// regardless of the rate flag in the frame header: 8 kHz audio plays back
+// at 2x speed ("chipmunk"). Verified on HL_PAN3 fw 4.50.17.25. Send 16 kHz
+// PCM in that case; every other codec/rate is passed through unchanged.
+func backchannelRate(codec byte, captureRate uint32) uint32 {
+	if codec == tutk.CodecPCML && captureRate == 8000 {
+		return 16000
+	}
+	return captureRate
 }
