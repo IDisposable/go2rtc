@@ -18,6 +18,10 @@ type fakeProducer struct {
 	core.Producer
 	spotlight *bool
 	photo     bool
+	rotDir    byte
+	rotSpeed  byte
+	ptzV      byte
+	ptzH      uint16
 }
 
 func (f *fakeProducer) SetSpotlight(on bool) error              { f.spotlight = &on; return nil }
@@ -27,10 +31,11 @@ func (f *fakeProducer) SetSiren(bool) error                     { return nil }
 func (f *fakeProducer) SetHorizontalFlip(bool) error            { return nil }
 func (f *fakeProducer) SetVerticalFlip(bool) error              { return nil }
 func (f *fakeProducer) TakePhoto() error                        { f.photo = true; return nil }
-func (f *fakeProducer) RotateByAction(byte, byte) error         { return nil }
+func (f *fakeProducer) RotateByAction(d, s byte) error          { f.rotDir, f.rotSpeed = d, s; return nil }
 func (f *fakeProducer) RotateByDegree(int16, int16, byte) error { return nil }
-func (f *fakeProducer) SetPTZPosition(byte, uint16) error       { return nil }
+func (f *fakeProducer) SetPTZPosition(v byte, h uint16) error   { f.ptzV, f.ptzH = v, h; return nil }
 func (f *fakeProducer) ResetRotation() error                    { return nil }
+func (f *fakeProducer) GetPTZPosition() (byte, uint16, error)   { return 12, 345, nil }
 
 func seedStream(t *testing.T, name string, prod core.Producer) {
 	s, err := streams.New(name)
@@ -93,4 +98,41 @@ func TestHandlePOSTSpotlight_ReadOnly(t *testing.T) {
 	handlePOSTSpotlight(w, req)
 
 	require.Equal(t, http.StatusForbidden, w.Code)
+}
+
+func TestHandlePOSTRotateAction_BodyKeys(t *testing.T) {
+	for _, body := range []string{`{"direction":3,"speed":4}`, `{"dir":3,"speed":4}`} {
+		fake := &fakeProducer{}
+		seedStream(t, "camrot", fake)
+		req := httptest.NewRequest("POST", "/api/wyze/rotate_action?src=camrot", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		handlePOSTRotateAction(w, req)
+		require.Equal(t, http.StatusOK, w.Code, body)
+		require.Equal(t, byte(3), fake.rotDir, body)
+		require.Equal(t, byte(4), fake.rotSpeed, body)
+		streams.Delete("camrot")
+	}
+}
+
+func TestHandlePOSTPTZPosition_BodyKeys(t *testing.T) {
+	for _, body := range []string{`{"v":20,"h":180}`, `{"vertical":20,"horizontal":180}`} {
+		fake := &fakeProducer{}
+		seedStream(t, "camptz", fake)
+		req := httptest.NewRequest("POST", "/api/wyze/ptz_position?src=camptz", strings.NewReader(body))
+		w := httptest.NewRecorder()
+		handlePOSTPTZPosition(w, req)
+		require.Equal(t, http.StatusOK, w.Code, body)
+		require.Equal(t, byte(20), fake.ptzV, body)
+		require.Equal(t, uint16(180), fake.ptzH, body)
+		streams.Delete("camptz")
+	}
+}
+
+func TestHandleGETPTZState(t *testing.T) {
+	seedStream(t, "camstate", &fakeProducer{})
+	req := httptest.NewRequest("GET", "/api/wyze/ptz_state?src=camstate", nil)
+	w := httptest.NewRecorder()
+	handleGETPTZState(w, req)
+	require.Equal(t, http.StatusOK, w.Code)
+	require.JSONEq(t, `{"vertical":12,"horizontal":345}`, w.Body.String())
 }

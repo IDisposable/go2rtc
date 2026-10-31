@@ -373,8 +373,16 @@ func (c *DTLSConn) WriteDTLS(payload []byte, channel byte) error {
 	return c.Write(frame)
 }
 
+// WriteIOCtrl sends an IOCtrl frame fire-and-forget over the DTLS client
+// session. It must go through the DTLS conn (like WriteAndWaitIOCtrl): the
+// raw UDP socket is unconnected, so writing to it fails with "destination
+// address required", and the camera only accepts encrypted IOCtrl anyway.
 func (c *DTLSConn) WriteIOCtrl(payload []byte) error {
-	_, err := c.conn.Write(c.msgIOCtrl(payload))
+	conn := c.client()
+	if conn == nil {
+		return fmt.Errorf("dtls client not ready")
+	}
+	_, err := conn.Write(c.msgIOCtrl(payload))
 	return err
 }
 

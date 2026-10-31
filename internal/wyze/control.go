@@ -23,6 +23,7 @@ type controller interface {
 	RotateByDegree(h, v int16, s byte) error
 	SetPTZPosition(v byte, h uint16) error
 	ResetRotation() error
+	GetPTZPosition() (byte, uint16, error)
 }
 
 type controlSpec struct {
@@ -42,6 +43,7 @@ var controlEndpoints = []controlSpec{
 	{"rotate_degree", handlePOSTRotateDegree},
 	{"ptz_position", handlePOSTPTZPosition},
 	{"reset_rotation", handlePOSTResetRotation},
+	{"ptz_state", handleGETPTZState},
 }
 
 func registerControlEndpoints() {
@@ -189,11 +191,20 @@ func handlePOSTRotateAction(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var body struct{ Dir, Speed byte }
+	// "direction" is what the wyze-bridge client sends; "dir" kept as alias.
+	var body struct {
+		Direction byte `json:"direction"`
+		Dir       byte `json:"dir"`
+		Speed     byte `json:"speed"`
+	}
 	if !decodeBody(w, r, &body) {
 		return
 	}
-	runControl(w, ctrl.RotateByAction(body.Dir, body.Speed))
+	dir := body.Direction
+	if dir == 0 {
+		dir = body.Dir
+	}
+	runControl(w, ctrl.RotateByAction(dir, body.Speed))
 }
 
 func handlePOSTRotateDegree(w http.ResponseWriter, r *http.Request) {
@@ -216,12 +227,21 @@ func handlePOSTPTZPosition(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// Accept both the short "v"/"h" keys (wyze-bridge client) and the long form.
 	var body struct {
-		Vertical   byte
-		Horizontal uint16
+		V          *byte   `json:"v"`
+		H          *uint16 `json:"h"`
+		Vertical   byte    `json:"vertical"`
+		Horizontal uint16  `json:"horizontal"`
 	}
 	if !decodeBody(w, r, &body) {
 		return
+	}
+	if body.V != nil {
+		body.Vertical = *body.V
+	}
+	if body.H != nil {
+		body.Horizontal = *body.H
 	}
 	runControl(w, ctrl.SetPTZPosition(body.Vertical, body.Horizontal))
 }
@@ -232,4 +252,25 @@ func handlePOSTResetRotation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	runControl(w, ctrl.ResetRotation())
+}
+
+// handleGETPTZState reports the motor's current absolute position:
+// {"vertical":0-40,"horizontal":0-350}. Read-only, so allowed in read-only mode.
+func handleGETPTZState(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		w.Header().Set("Allow", "GET")
+		http.Error(w, "GET required", http.StatusMethodNotAllowed)
+		return
+	}
+	ctrl, err := findWyzeController(r.URL.Query().Get("src"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	v, h, err := ctrl.GetPTZPosition()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	api.ResponseJSON(w, map[string]any{"vertical": v, "horizontal": h})
 }

@@ -81,6 +81,7 @@ const (
 	KCmdRotateByDegree = 11000 // <hhB h:i16 v:i16 speed:u8
 	KCmdRotateByAction = 11002 // [dir:1, dir:1, speed:1] (dir duplicated)
 	KCmdResetRotate    = 11004 // [position:1]
+	KCmdGetCurCruise   = 11006 // <I ts; resp <IBH ts + v:u8 + h:u16
 	KCmdSetPTZPosition = 11018 // <IBH ts_ms + v:u8(0-40) + h:u16(0-350)
 	KCmdGetMotionTrack = 11020
 	KCmdSetMotionTrack = 11022 // [value:1]
@@ -171,13 +172,34 @@ func (c *Client) TakePhoto() error {
 	return c.SendControl(KCmdTakePhoto, []byte{1})
 }
 
-// RotateByAction moves the pan/tilt motor discretely. Direction is duplicated
-// per the wyzecam K11002 payload layout.
+// RotateByAction nudges the pan/tilt motor one step in a direction.
+// dir: 0=stop, 1=left, 2=right, 3=up, 4=down. speed: 1-9 (0 = default 5).
+//
+// K11002 payload is [horizontal, vertical, speed] where horizontal is
+// 1=left/2=right and vertical is 1=up/2=down (wyzecam K11002SetRotaryByAction).
+// The axes are separate bytes; sending dir in both would move diagonally.
 func (c *Client) RotateByAction(dir, speed byte) error {
-	if dir < 1 || dir > 4 {
-		return fmt.Errorf("wyze: rotate direction %d outside [1,4]", dir)
+	var h, v byte
+	switch dir {
+	case 0:
+		// stop: both axes idle
+	case 1, 2:
+		h = dir
+	case 3, 4:
+		v = dir - 2
+	default:
+		return fmt.Errorf("wyze: rotate direction %d outside [0,4]", dir)
 	}
-	return c.SendControl(KCmdRotateByAction, []byte{dir, dir, speed})
+	return c.SendControl(KCmdRotateByAction, []byte{h, v, clampSpeed(speed)})
+}
+
+// clampSpeed maps a requested motor speed onto the firmware's 1-9 range,
+// using the wyzecam default of 5 when unset or out of range.
+func clampSpeed(speed byte) byte {
+	if speed < 1 || speed > 9 {
+		return 5
+	}
+	return speed
 }
 
 // RotateByDegree moves by relative degrees. Vertical is int16 on the wire but
@@ -189,24 +211,49 @@ func (c *Client) RotateByDegree(hDeg, vDeg int16, speed byte) error {
 	p := make([]byte, 5)
 	binary.LittleEndian.PutUint16(p[0:], uint16(hDeg))
 	binary.LittleEndian.PutUint16(p[2:], uint16(vDeg))
-	p[4] = speed
+	p[4] = clampSpeed(speed)
 	return c.SendControl(KCmdRotateByDegree, p)
 }
 
 // SetPTZPosition moves to an absolute position. Timestamp is injected here
-// (camera uses it for sequencing).
+// (camera uses it for sequencing). Ranges are model-dependent: Pan v1/v2 tilt
+// 0-40, Pan v3 reports tilt 0-180 (0 = straight up) and pan 0-359, so only the
+// widest physical bounds are enforced here; the firmware clamps the rest.
 func (c *Client) SetPTZPosition(vertical byte, horizontal uint16) error {
-	if vertical > 40 {
-		return fmt.Errorf("wyze: ptz vertical %d outside [0,40]", vertical)
+	if vertical > 180 {
+		return fmt.Errorf("wyze: ptz vertical %d outside [0,180]", vertical)
 	}
-	if horizontal > 350 {
-		return fmt.Errorf("wyze: ptz horizontal %d outside [0,350]", horizontal)
+	if horizontal > 359 {
+		return fmt.Errorf("wyze: ptz horizontal %d outside [0,359]", horizontal)
 	}
 	p := make([]byte, 7)
 	binary.LittleEndian.PutUint32(p[0:], uint32(time.Now().UnixMilli()%1_000_000_000))
 	p[4] = vertical
 	binary.LittleEndian.PutUint16(p[5:], horizontal)
 	return c.SendControl(KCmdSetPTZPosition, p)
+}
+
+// GetPTZPosition asks the motor for its current absolute position.
+// K11006 request carries a uint32 timestamp; the K11007 response payload is
+// <IBH = uint32 timestamp, uint8 vertical (0-40), uint16 horizontal (0-350).
+func (c *Client) GetPTZPosition() (vertical byte, horizontal uint16, err error) {
+	c.ptzReadMu.Lock()
+	defer c.ptzReadMu.Unlock()
+	req := make([]byte, 4)
+	binary.LittleEndian.PutUint32(req, uint32(time.Now().Unix()))
+	data, err := c.SendControlWait(KCmdGetCurCruise, KCmdGetCurCruise+1, req, 5*time.Second)
+	if err != nil {
+		return 0, 0, err
+	}
+	return parsePTZPosition(c.extractHL(data))
+}
+
+func parsePTZPosition(hl []byte) (vertical byte, horizontal uint16, err error) {
+	_, payload, ok := tutk.ParseHL(hl)
+	if !ok || len(payload) < 7 {
+		return 0, 0, fmt.Errorf("wyze: short K11007 response (%d bytes)", len(payload))
+	}
+	return payload[4], binary.LittleEndian.Uint16(payload[5:]), nil
 }
 
 // ResetRotation returns the motor to its stored home position.
@@ -239,3 +286,4 @@ func (p *Producer) RotateByDegree(h, v int16, s byte) error {
 }
 func (p *Producer) SetPTZPosition(v byte, h uint16) error { return p.client.SetPTZPosition(v, h) }
 func (p *Producer) ResetRotation() error                  { return p.client.ResetRotation() }
+func (p *Producer) GetPTZPosition() (byte, uint16, error) { return p.client.GetPTZPosition() }

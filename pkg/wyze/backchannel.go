@@ -32,11 +32,20 @@ func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Re
 	samplesPerFrame := tutk.GetSamplesPerFrame(tutkCodec)
 	frameDurationUS := samplesPerFrame * 1000000 / sampleRate
 
+	// The camera times playback by the frame timestamp and assumes
+	// samplesPerFrame per frame. RTP packets from ffmpeg often carry more
+	// (e.g. 320 PCM samples = 40ms), which played back at 2x speed. Split
+	// raw PCM payloads into exact samplesPerFrame chunks so every frame's
+	// duration matches the timestamp step.
+	frameBytes := pcmFrameBytes(tutkCodec, samplesPerFrame, channels)
+
 	sender.Handler = func(pkt *rtp.Packet) {
-		if err := p.client.WriteAudio(tutkCodec, pkt.Payload, timestamp, sampleRate, channels); err == nil {
-			p.Send += len(pkt.Payload)
+		for _, chunk := range splitFrames(pkt.Payload, frameBytes) {
+			if err := p.client.WriteAudio(tutkCodec, chunk, timestamp, sampleRate, channels); err == nil {
+				p.Send += len(chunk)
+			}
+			timestamp += frameDurationUS
 		}
-		timestamp += frameDurationUS
 	}
 
 	switch track.Codec.Name {
@@ -52,4 +61,33 @@ func (p *Producer) AddTrack(media *core.Media, codec *core.Codec, track *core.Re
 	p.Senders = append(p.Senders, sender)
 
 	return nil
+}
+
+// pcmFrameBytes returns the byte size of one camera audio frame for raw PCM
+// codecs, or 0 for compressed codecs (sent as-is, one packet per frame).
+func pcmFrameBytes(codec byte, samplesPerFrame uint32, channels uint8) int {
+	if channels == 0 {
+		channels = 1
+	}
+	switch codec {
+	case tutk.CodecPCML:
+		return int(samplesPerFrame) * 2 * int(channels)
+	case tutk.CodecPCMU, tutk.CodecPCMA:
+		return int(samplesPerFrame) * int(channels)
+	}
+	return 0
+}
+
+// splitFrames cuts payload into frameBytes-sized chunks; the final short
+// chunk is kept. frameBytes <= 0 returns the payload unchanged.
+func splitFrames(payload []byte, frameBytes int) [][]byte {
+	if frameBytes <= 0 || len(payload) <= frameBytes {
+		return [][]byte{payload}
+	}
+	out := make([][]byte, 0, (len(payload)+frameBytes-1)/frameBytes)
+	for len(payload) > frameBytes {
+		out = append(out, payload[:frameBytes])
+		payload = payload[frameBytes:]
+	}
+	return append(out, payload)
 }
